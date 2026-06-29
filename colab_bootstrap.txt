@@ -1,0 +1,13 @@
+# ── In Tandem DS take-home — Colab one-cell bootstrap ──────────────────────
+# Replace <REPO_URL> with the repo we sent you, then run this cell.
+!git clone -q <REPO_URL> task
+%cd task
+!pip -q install -r requirements.txt
+import pandas as pd
+train   = pd.read_csv("data/train.csv")     # randomized experiment: has treatment, churned
+holdout = pd.read_csv("data/holdout.csv")    # disjoint slice for HONEST evaluation (don't train on it)
+scoring = pd.read_csv("data/scoring.csv")    # prospective users to TARGET (no treatment/churned)
+print(train.shape, holdout.shape, scoring.shape)
+# Build an uplift model, then write your two deliverables:
+#   target.csv         -> user_id of the <=6,000 (15%) you choose to treat
+#   holdout_scores.csv -> user_id, uplift_score for EVERY holdout row
