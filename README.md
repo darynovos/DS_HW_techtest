@@ -31,7 +31,7 @@ Deliver as a **GitHub repo** (preferred) or a single runnable **Colab notebook**
 
 ## Notes
 - Data is **synthetic** — no real user data.
-- Time: aim for **3–4 hours**; you're not expected to finish everything — submit what you
-  have and show your working.
+- Time: **open-ended** — no time limit, and you're not expected to finish everything.
+  Submit what you have and show your working.
 - AI assistance is encouraged — just note how you used it. (A one-shot with no visible
   iteration scores poorly — see TASK.md §7.)

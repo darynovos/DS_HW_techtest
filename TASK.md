@@ -3,7 +3,7 @@
 **Role:** Product Data Scientist, In Tandem
 **Stage:** Technical exercise (for candidates who cleared the résumé/application screen)
 **Format:** Build-anywhere take-home on a **free environment** — Google Colab, Kaggle, or Databricks Community Edition. We provide a synthetic dataset (no proprietary data, no paid compute). Self-reported results; we re-run the top submissions to confirm they reproduce.
-**Time guidance:** Aim for **3–4 hours.** It is fine — expected, even — not to finish every part. **Submit what you have and show your working** (see §5).
+**Time guidance:** Open-ended — spend as much or as little as you like. We're not timing you, and we don't expect every part finished. **Submit what you have, scope honestly, and show your working** (see §5).
 
 ---
 
