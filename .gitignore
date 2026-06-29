@@ -5,3 +5,4 @@ __pycache__/
 # candidate outputs (don't commit until submitting)
 # target.csv
 # holdout_scores.csv
+.DS_Store
