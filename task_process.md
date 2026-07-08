@@ -239,6 +239,255 @@ explore_churn_rates(train_df, "months_since_last_active", True)
 explore_churn_rates(train_df, "mrr", True)
 ```
 
+<!-- #region -->
+# Modeling
+
+**Main outcomes of the section**
+
+To establish a naive baseline, I first built a churn prediction model using XGBoost, which is a powerful gradient boosting algorithm widely used for binary classification tasks. As a preprocessing step, the categorical feature acquisition_channel was one-hot encoded into dummy variables.
+
+The model achieved a ROC AUC of 0.63, indicating a moderate ability to distinguish between customers who churn and those who remain. The PR AUC was 0.50, which is substantially higher than the baseline churn rate of approximately 38%, suggesting that the model identifies high-risk customers better than random guessing.
+
+Following the naive strategy described in the assignment, I ranked customers by their predicted churn probability and assigned the most expensive retention offer (arm 3, concierge) to the highest-risk users, while all remaining customers received no offer (arm 0).
+Only observations where the randomized offer matched the assigned offer contributed to the estimate. Since only about one-quarter of customers matched, the results were scaled accordingly to estimate the value for the full population.
+
+Compared with the "no-offer" scenario, the naive churn-based strategy produced an incremental net value of approximately −$42.9k. This negative result demonstrates that customers with the highest predicted churn risk are not necessarily the customers who are most responsive to retention offers.
+
+
+
+As first uplift modeling approach I used a T-learner. I trained one separate churn model for each randomized offer arm and then predicted each user’s potential churn probability under every arm. Because the offer was randomized, differences between the predicted churn probability under no offer and under each paid offer can be interpreted as estimated per-user treatment effects. This approach is simple, transparent, and well suited as a first causal baseline after the naive churn model.
+<!-- #endregion -->
+
+```python
+from xgboost import XGBClassifier
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+)
+from sklearn.metrics import classification_report
+```
+
+```python
+BUDGET = 40000
+COST_ARM_MAP = { 0:0,
+                1:1,
+                2:5,
+                3:15
+                }
+```
+
+```python
+# Encode acquisition channel
+
+train = pd.get_dummies(train,
+    columns=["acquisition_channel"],
+    drop_first=False,
+    dtype=int
+)
+
+holdout = pd.get_dummies(holdout,
+    columns=["acquisition_channel"],
+    drop_first=False,
+    dtype=int
+)
+
+scoring = pd.get_dummies(scoring,
+    columns=["acquisition_channel"],
+    drop_first=False,
+    dtype=int
+)
+
+```
+
+```python
+train_features = ['tenure_months', 'active_days_30d', 'sessions_30d',
+       'family_members', 'features_used', 'support_tickets_90d', 'price_tier',
+       'months_since_last_active', 'autopay', 'prior_offers', 'mrr',  
+       'acquisition_channel_app_store', 'acquisition_channel_organic',
+       'acquisition_channel_paid_search', 'acquisition_channel_referral']
+```
+
+```python
+X_train = train[train_features]
+y_train = train['churned']
+
+X_test = holdout[train_features]
+y_test = holdout['churned']
+
+X_score = scoring[train_features]
+```
+
+## 3. Baseline churn model
+
+```python
+train["churned"].value_counts(normalize=True)
+```
+
+```python
+model_baseline = XGBClassifier(
+    n_estimators=300,
+    max_depth=5,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    random_state=42,
+    n_jobs=-1
+)
+
+model_baseline.fit(X_train, y_train)
+y_pred_proba = model_baseline.predict_proba(X_test)[:, 1]
+y_pred = (y_pred_proba > 0.5).astype(int)
+```
+
+```python
+print("ROC AUC:", roc_auc_score(y_test, y_pred_proba))
+print("PR AUC :", average_precision_score(y_test, y_pred_proba))
+```
+
+```python
+print(classification_report(y_test, y_pred))
+```
+
+```python
+# Check value of the baseline model
+holdout["baseline_pred_proba"] = y_pred_proba 
+
+n_target = BUDGET //COST_ARM_MAP[3]
+baseline_cost = n_target*COST_ARM_MAP[3]
+holdout['baseline_offer_arm'] = 0
+
+high_risk = (
+    holdout
+    .sort_values("baseline_pred_proba", ascending=False)
+    .head(n_target)
+    .index
+)
+
+
+holdout.loc[high_risk, "baseline_offer_arm"] = 3
+```
+
+```python
+matched_offer_arm = holdout[holdout['offer_arm'] == holdout['baseline_offer_arm']].copy()
+```
+
+```python
+# Value of model with offer 3 for high risk users 
+matched_offer_arm["retained_value"] = ((1 - matched_offer_arm["churned"])  * matched_offer_arm["annual_value"])
+matched_offer_arm["offer_cost"] = matched_offer_arm["baseline_offer_arm"].map(COST_ARM_MAP)
+matched_offer_arm["net_value"] = ( matched_offer_arm["retained_value"] - matched_offer_arm["offer_cost"])
+net_baseline = matched_offer_arm["net_value"].sum()
+print(f"Matched rows:{matched_offer_arm.shape[0]}")
+print(f'Net value of baseline: {net_baseline*4}')
+
+# Value of model without offer
+control = holdout[holdout["offer_arm"] == 0].copy()
+control["net_value"] = ((1 - control["churned"]) * control["annual_value"])
+control_net_value = control["net_value"].sum()
+print(f"Control matched rows: {control.shape[0]}")
+print(f'Net value of control: {control_net_value*4}')
+
+# incremental effetc of baseline model
+incremental_value_baseline = net_baseline*4 - control_net_value*4
+print(f'Incremental value of baseline: {incremental_value_baseline}')
+
+```
+
+## 4. Effect of each offer per User
+
+```python
+t_learner_models = {}
+arms = [0, 1, 2, 3]
+
+for arm in arms:
+    train_arm = train[train["offer_arm"] == arm].copy()
+
+    X_arm = train_arm[train_features]
+    y_arm = train_arm["churned"]
+
+    model = XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=-1
+    )
+
+    model.fit(X_arm, y_arm)
+
+    t_learner_models[arm] = model
+
+    # This AUC is only diagnostic, not the final success metric
+    holdout_pred = model.predict_proba(holdout[train_features])[:, 1]
+
+    print(f"Arm {arm}")
+    print("Rows:", train_arm.shape[0])
+    print("Holdout ROC AUC:", roc_auc_score(holdout["churned"], holdout_pred))
+    print("Holdout PR AUC :", average_precision_score(holdout["churned"], holdout_pred))
+    print('-'*50)
+```
+
+```python
+for arm in arms:
+    holdout[f"t_pred_churn_arm_{arm}"] = t_learner_models[arm].predict_proba( holdout[train_features] )[:, 1]
+
+for arm in [1, 2, 3]:
+    holdout[f"t_uplift_arm_{arm}"] = (holdout["t_pred_churn_arm_0"] - holdout[f"t_pred_churn_arm_{arm}"] )
+
+for arm in [1, 2, 3]:
+    holdout[f"t_expected_net_value_arm_{arm}"] = (holdout[f"t_uplift_arm_{arm}"] * holdout["annual_value"] - COST_ARM_MAP[arm] )
+```
+
+```python
+uplift_cols = [
+    "t_uplift_arm_1",
+    "t_uplift_arm_2",
+    "t_uplift_arm_3"
+]
+
+net_value_cols = [
+    "t_expected_net_value_arm_1",
+    "t_expected_net_value_arm_2",
+    "t_expected_net_value_arm_3"
+]
+
+print("Uplift summary")
+holdout[uplift_cols].describe()
+```
+
+```python
+print("Expected net value summary")
+holdout[net_value_cols].describe()
+```
+
+```python
+candidate_value_cols = {
+    1: "t_expected_net_value_arm_1",
+    2: "t_expected_net_value_arm_2",
+    3: "t_expected_net_value_arm_3"
+}
+
+holdout["t_best_arm"] = 0
+holdout["t_best_value"] = 0.0
+
+for arm, col in candidate_value_cols.items():
+    better = holdout[col] > holdout["t_best_value"]
+    holdout.loc[better, "t_best_arm"] = arm
+    holdout.loc[better, "t_best_value"] = holdout.loc[better, col]
+
+holdout["t_best_arm"].value_counts(normalize=True)
+```
+
+```python
+holdout[["offer_arm", "t_best_arm","churned"]]
+```
+
 ```python
 
 ```
