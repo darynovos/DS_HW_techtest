@@ -13,7 +13,7 @@ jupyter:
 ---
 
 ```python
-!pip -q install -r requirements.txt
+#!pip -q install -r requirements.txt
 ```
 
 ```python
@@ -259,6 +259,20 @@ As first uplift modeling approach I used a T-learner. I trained one separate chu
 <!-- #endregion -->
 
 ```python
+def estimate_policy_value(df, policy_col, cost_map, propensity=0.25):
+    matched = df[df["offer_arm"] == df[policy_col]].copy()
+
+    matched["retained_value"] = (1 - matched["churned"]) * matched["annual_value"]
+    matched["offer_cost"] = matched[policy_col].map(cost_map)
+    matched["net_value"] = matched["retained_value"] - matched["offer_cost"]
+
+    # IPW / matched estimator: divide by assignment probability
+    estimated_value = matched["net_value"].sum() / propensity
+
+    return estimated_value, matched
+```
+
+```python
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     roc_auc_score,
@@ -370,28 +384,35 @@ holdout.loc[high_risk, "baseline_offer_arm"] = 3
 ```
 
 ```python
-matched_offer_arm = holdout[holdout['offer_arm'] == holdout['baseline_offer_arm']].copy()
-```
+# 1. No-offer policy
+holdout["no_offer_policy"] = 0
 
-```python
-# Value of model with offer 3 for high risk users 
-matched_offer_arm["retained_value"] = ((1 - matched_offer_arm["churned"])  * matched_offer_arm["annual_value"])
-matched_offer_arm["offer_cost"] = matched_offer_arm["baseline_offer_arm"].map(COST_ARM_MAP)
-matched_offer_arm["net_value"] = ( matched_offer_arm["retained_value"] - matched_offer_arm["offer_cost"])
-net_baseline = matched_offer_arm["net_value"].sum()
-print(f"Matched rows:{matched_offer_arm.shape[0]}")
-print(f'Net value of baseline: {net_baseline*4}')
+no_offer_value, no_offer_matched = estimate_policy_value(
+    holdout,
+    "no_offer_policy",
+    COST_ARM_MAP
+)
 
-# Value of model without offer
-control = holdout[holdout["offer_arm"] == 0].copy()
-control["net_value"] = ((1 - control["churned"]) * control["annual_value"])
-control_net_value = control["net_value"].sum()
-print(f"Control matched rows: {control.shape[0]}")
-print(f'Net value of control: {control_net_value*4}')
+# 2. Naive churn baseline policy
+baseline_value, baseline_matched = estimate_policy_value(
+    holdout,
+    "baseline_offer_arm",
+    COST_ARM_MAP
+)
 
-# incremental effetc of baseline model
-incremental_value_baseline = net_baseline*4 - control_net_value*4
-print(f'Incremental value of baseline: {incremental_value_baseline}')
+print("Estimated holdout policy values")
+print("--------------------------------")
+print(f"No-offer policy value:      {no_offer_value:,.2f}")
+print(f"Churn baseline value:       {baseline_value:,.2f}")
+
+print("\nIncremental values")
+print("--------------------------------")
+print(f"Baseline vs no-offer:       {baseline_value - no_offer_value:,.2f}")
+
+print("\nMatched rows")
+print("--------------------------------")
+print(f"No-offer matched rows:      {len(no_offer_matched)}")
+print(f"Baseline matched rows:      {len(baseline_matched)}")
 
 ```
 
@@ -435,7 +456,7 @@ for arm in arms:
 
 ```python
 for arm in arms:
-    holdout[f"t_pred_churn_arm_{arm}"] = t_learner_models[arm].predict_proba( holdout[train_features] )[:, 1]
+    holdout[f"t_pred_churn_arm_{arm}"] = t_learner_models[arm].predict_proba(holdout[train_features] )[:, 1]
 
 for arm in [1, 2, 3]:
     holdout[f"t_uplift_arm_{arm}"] = (holdout["t_pred_churn_arm_0"] - holdout[f"t_pred_churn_arm_{arm}"] )
@@ -467,7 +488,14 @@ holdout[net_value_cols].describe()
 ```
 
 ```python
-candidate_value_cols = {
+#  net value for each arm
+for arm in [1, 2, 3]:
+    holdout[f"t_expected_net_value_arm_{arm}"] = (holdout[f"t_uplift_arm_{arm}"] * holdout["annual_value"] - COST_ARM_MAP[arm] )
+
+```
+
+```python
+value_cols = {
     1: "t_expected_net_value_arm_1",
     2: "t_expected_net_value_arm_2",
     3: "t_expected_net_value_arm_3"
@@ -476,18 +504,219 @@ candidate_value_cols = {
 holdout["t_best_arm"] = 0
 holdout["t_best_value"] = 0.0
 
-for arm, col in candidate_value_cols.items():
+for arm, col in value_cols.items():
     better = holdout[col] > holdout["t_best_value"]
     holdout.loc[better, "t_best_arm"] = arm
     holdout.loc[better, "t_best_value"] = holdout.loc[better, col]
 
+```
+
+```python
+holdout["t_best_cost"] = holdout["t_best_arm"].map(COST_ARM_MAP)
+holdout["t_best_roi"] = 0.0
+
+paid_offer = holdout["t_best_cost"] > 0
+holdout.loc[paid_offer, "t_best_roi"] = ( holdout.loc[paid_offer, "t_best_value"]/holdout.loc[paid_offer, "t_best_cost"])
+```
+
+# 5. Allocation for Holdout and Evaluation
+
+```python
 holdout["t_best_arm"].value_counts(normalize=True)
 ```
 
 ```python
-holdout[["offer_arm", "t_best_arm","churned"]]
+candidates = holdout[(holdout["t_best_arm"] != 0)   & (holdout["t_best_value"] > 0)].copy()
+
+candidates = candidates.sort_values("t_best_roi", ascending=False)
+
+allocation = holdout[["user_id"]].copy()
+allocation["assigned_offer_arm"] = 0
+
+used_budget = 0
+
+for idx, row in candidates.iterrows():
+    cost = COST_ARM_MAP[row["t_best_arm"]]
+
+    if used_budget + cost > BUDGET:
+        continue
+
+    allocation.loc[allocation["user_id"] == row["user_id"], "assigned_offer_arm" ] = int(row["t_best_arm"])
+
+    used_budget += cost
+
+print("Used budget:", used_budget)
+print("Remaining budget:", BUDGET - used_budget)
+print(allocation["assigned_offer_arm"].value_counts())
 ```
 
 ```python
+holdout = holdout.merge(allocation, on='user_id')
+holdout.head()
+```
 
+```python
+matched_offer_arm = holdout[holdout['offer_arm'] == holdout['assigned_offer_arm']].copy()
+matched_offer_arm['assigned_offer_arm'].value_counts()
+```
+
+```python
+# 1. No-offer policy
+holdout["no_offer_policy"] = 0
+
+no_offer_value, no_offer_matched = estimate_policy_value(
+    holdout,
+    "no_offer_policy",
+    COST_ARM_MAP
+)
+
+# 2. Naive churn baseline policy
+baseline_value, baseline_matched = estimate_policy_value(
+    holdout,
+    "baseline_offer_arm",
+    COST_ARM_MAP
+)
+
+# 3. Your uplift allocation policy
+uplift_value, uplift_matched = estimate_policy_value(
+    holdout,
+    "assigned_offer_arm",
+    COST_ARM_MAP
+)
+
+
+print("Estimated holdout policy values")
+print("--------------------------------")
+print(f"No-offer policy value:      {no_offer_value:,.2f}")
+print(f"Churn baseline value:       {baseline_value:,.2f}")
+print(f"Uplift allocation value:    {uplift_value:,.2f}")
+
+print("\nIncremental values")
+print("--------------------------------")
+print(f"Baseline vs no-offer:       {baseline_value - no_offer_value:,.2f}")
+print(f"Uplift vs no-offer:         {uplift_value - no_offer_value:,.2f}")
+print(f"Uplift vs churn baseline:   {uplift_value - baseline_value:,.2f}")
+
+print("\nMatched rows")
+print("--------------------------------")
+print(f"No-offer matched rows:      {len(no_offer_matched)}")
+print(f"Baseline matched rows:      {len(baseline_matched)}")
+print(f"Uplift matched rows:        {len(uplift_matched)}")
+```
+
+```python
+holdout["uplift_score"] = holdout[[
+                                    "t_uplift_arm_1",
+                                    "t_uplift_arm_2",
+                                    "t_uplift_arm_3"]].max(axis=1)
+```
+
+```python
+from sklift.metrics import qini_auc_score
+
+arms = [1, 2, 3]
+
+for arm in arms:
+    arm_df = holdout[holdout["offer_arm"].isin([0,arm])].copy()
+    treatment = (arm_df["offer_arm"] == arm).astype(int)
+
+    score = arm_df[f"t_uplift_arm_{arm}"]
+
+    qini = qini_auc_score(
+        y_true=1-arm_df["churned"],   # retention
+        uplift=score,
+        treatment=treatment
+    )
+    print(f"Qini AUC for arm {arm}: {qini:.4f}")
+```
+
+# 6. Allocation for scoring
+
+```python
+arms = [0, 1, 2, 3]
+
+for arm in arms:
+    scoring[f"t_pred_churn_arm_{arm}"] = t_learner_models[arm].predict_proba(scoring[train_features] )[:, 1]
+
+for arm in [1, 2, 3]:
+    scoring[f"t_uplift_arm_{arm}"] = (scoring["t_pred_churn_arm_0"] - scoring[f"t_pred_churn_arm_{arm}"] )
+
+for arm in [1, 2, 3]:
+    scoring[f"t_expected_net_value_arm_{arm}"] = (scoring[f"t_uplift_arm_{arm}"] * scoring["annual_value"] - COST_ARM_MAP[arm] )
+```
+
+```python
+uplift_cols = [
+    "t_uplift_arm_1",
+    "t_uplift_arm_2",
+    "t_uplift_arm_3"
+]
+
+net_value_cols = [
+    "t_expected_net_value_arm_1",
+    "t_expected_net_value_arm_2",
+    "t_expected_net_value_arm_3"
+]
+
+print("Uplift summary")
+scoring[uplift_cols].describe()
+```
+
+```python
+value_cols = {
+    1: "t_expected_net_value_arm_1",
+    2: "t_expected_net_value_arm_2",
+    3: "t_expected_net_value_arm_3"
+}
+
+scoring["t_best_arm"] = 0
+scoring["t_best_value"] = 0.0
+
+for arm, col in value_cols.items():
+    better = scoring[col] > scoring["t_best_value"]
+    scoring.loc[better, "t_best_arm"] = arm
+    scoring.loc[better, "t_best_value"] = scoring.loc[better, col]
+
+```
+
+```python
+scoring["t_best_cost"] = scoring["t_best_arm"].map(COST_ARM_MAP)
+scoring["t_best_roi"] = 0.0
+
+paid_offer = scoring["t_best_cost"] > 0
+scoring.loc[paid_offer, "t_best_roi"] = ( scoring.loc[paid_offer, "t_best_value"]/scoring.loc[paid_offer, "t_best_cost"])
+```
+
+```python
+## Allocation for scoring dataset#
+candidates = scoring[(scoring["t_best_arm"] != 0)   & (scoring["t_best_value"] > 0)].copy()
+
+candidates = candidates.sort_values("t_best_roi", ascending=False)
+
+allocation = scoring[["user_id"]].copy()
+allocation["assigned_offer_arm"] = 0
+
+used_budget = 0
+
+for idx, row in candidates.iterrows():
+    cost = COST_ARM_MAP[row["t_best_arm"]]
+
+    if used_budget + cost > BUDGET:
+        continue
+
+    allocation.loc[allocation["user_id"] == row["user_id"], "assigned_offer_arm" ] = int(row["t_best_arm"])
+
+    used_budget += cost
+
+print("Used budget:", used_budget)
+print("Remaining budget:", BUDGET - used_budget)
+print(allocation["assigned_offer_arm"].value_counts())
+```
+
+# Save results
+
+```python
+holdout[['user_id', 'uplift_score']].to_csv("holdout_scores.csv", index=False)
+allocation.rename(columns={"assigned_offer_arm": "offer_arm"}, inplace=True)
+allocation.to_csv("allocation.csv", index=False)
 ```
