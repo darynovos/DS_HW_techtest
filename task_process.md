@@ -21,6 +21,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklift.metrics import qini_curve, qini_auc_score
 ```
 
 ```python
@@ -437,13 +438,17 @@ for arm in arms:
 
     t_learner_models[arm] = model
 
-    # This AUC is only diagnostic, not the final success metric
+    # Models have estimated only for observed arm
     holdout_pred = model.predict_proba(holdout[train_features])[:, 1]
+    holdout_arm = holdout.copy()
+    holdout_arm["pred_proba"] = holdout_pred
+    holdout_arm = holdout_arm[holdout_arm["offer_arm"] == arm]
+
 
     print(f"Arm {arm}")
     print("Rows:", train_arm.shape[0])
-    print("Holdout ROC AUC:", roc_auc_score(holdout["churned"], holdout_pred))
-    print("Holdout PR AUC :", average_precision_score(holdout["churned"], holdout_pred))
+    print("Holdout ROC AUC:", roc_auc_score(holdout_arm["churned"], holdout_arm["pred_proba"]))
+    print("Holdout PR AUC :", average_precision_score(holdout_arm["churned"], holdout_arm["pred_proba"]))
     print('-'*50)
 ```
 
@@ -457,32 +462,6 @@ for arm in [1, 2, 3]:
 
 for arm in [1, 2, 3]:
     holdout_df[f"t_expected_net_value_arm_{arm}"] = (holdout_df[f"t_uplift_arm_{arm}"] * holdout_df["annual_value"] - COST_ARM_MAP[arm] )
-```
-
-```python
-uplift_cols = [
-    "t_uplift_arm_1",
-    "t_uplift_arm_2",
-    "t_uplift_arm_3"
-]
-
-net_value_cols = [
-    "t_expected_net_value_arm_1",
-    "t_expected_net_value_arm_2",
-    "t_expected_net_value_arm_3"
-]
-
-print("Uplift summary")
-print(holdout_df[uplift_cols].describe())
-
-#  net value for each arm
-for arm in [1, 2, 3]:
-    holdout_df[f"t_expected_net_value_arm_{arm}"] = (holdout_df[f"t_uplift_arm_{arm}"] * holdout_df["annual_value"] - COST_ARM_MAP[arm] )
-```
-
-```python
-print("Expected net value summary")
-holdout_df[net_value_cols].describe()
 ```
 
 ```python
@@ -505,70 +484,74 @@ for arm, col in value_cols.items():
 ## Sleeping dogs treatement
 
 ```python
-holdout_df["sleeping_dog"] = (
-    (holdout_df["tenure_months"] >21)|
-    (holdout_df["support_tickets_90d"]>=4)|    
-    (holdout_df["active_days_30d"] <= 1) 
-)
+def sleeping_dogs_treatment(df):
+    df = df.copy()
+    df["sleeping_dog"] = (
+                        (df["tenure_months"] >21)|
+                        (df["support_tickets_90d"]>=4)|    
+                        (df["active_days_30d"] <= 1) 
+                        )
 
-holdout_df.loc[holdout_df["sleeping_dog"], "t_best_arm"] = 0
-holdout_df.loc[holdout_df["sleeping_dog"], "t_best_value"] = 0
+    df.loc[df["sleeping_dog"], "t_best_arm"] = 0
+    df.loc[df["sleeping_dog"], "t_best_value"] = 0
+    return df
 ```
 
 ```python
-holdout_df
+holdout_df_sd = sleeping_dogs_treatment(holdout_df)
 ```
 
 # 5. Allocation for Holdout and Evaluation
 
 ```python
-holdout_df["t_best_cost"] = holdout_df["t_best_arm"].map(COST_ARM_MAP)
-holdout_df["t_best_roi"] = 0.0
-paid_offer = holdout_df["t_best_cost"] > 0
-holdout_df.loc[paid_offer, "t_best_roi"] = (holdout_df.loc[paid_offer, "t_best_value"] / holdout_df.loc[paid_offer, "t_best_cost"])
+def budget_allocation(df, budget, cost_map):
+    df = df.copy()
+    df["t_best_cost"] = df["t_best_arm"].map(cost_map)
+    df["t_best_roi"] = 0.0
+
+    paid_offer = df["t_best_cost"] > 0
+    df.loc[paid_offer, "t_best_roi"] = (df.loc[paid_offer, "t_best_value"] / df.loc[paid_offer, "t_best_cost"])
+
+    # filter candidates for allocation
+    candidates = df[(df["t_best_arm"] != 0) & (df["t_best_value"] > 0)].copy()
+    candidates = candidates.sort_values("t_best_roi", ascending=False)
+
+    allocation = df[["user_id"]].copy()
+    allocation["assigned_offer_arm"] = 0
+
+    used_budget = 0
+
+    for idx, row in candidates.iterrows():
+        cost = cost_map[row["t_best_arm"]]
+
+        if used_budget + cost > budget:
+            continue
+
+        allocation.loc[allocation["user_id"] == row["user_id"], "assigned_offer_arm"] = int(row["t_best_arm"])
+
+        used_budget += cost
+
+    print("Used budget:", used_budget)
+    print("Remaining budget:", budget - used_budget)
+    print(allocation["assigned_offer_arm"].value_counts())
+    return allocation
+
 ```
 
 ```python
-holdout_df
-```
-
-```python
-holdout_df["t_best_arm"].value_counts(normalize=True)
-```
-
-```python
-candidates = holdout_df[(holdout_df["t_best_arm"] != 0)   & (holdout_df["t_best_value"] > 0)].copy()
-
-candidates = candidates.sort_values("t_best_roi", ascending=False)
-
-holdout_allocation = holdout_df[["user_id"]].copy()
-holdout_allocation["assigned_offer_arm"] = 0
-
-used_budget = 0
-
-for idx, row in candidates.iterrows():
-    cost = COST_ARM_MAP[row["t_best_arm"]]
-
-    if used_budget + cost > BUDGET:
-        continue
-
-    holdout_allocation.loc[holdout_allocation["user_id"] == row["user_id"], "assigned_offer_arm"] = int(row["t_best_arm"])
-
-    used_budget += cost
-
-print("Used budget:", used_budget)
-print("Remaining budget:", BUDGET - used_budget)
-print(holdout_allocation["assigned_offer_arm"].value_counts())
-```
-
-```python
+holdout_allocation = budget_allocation(holdout_df, BUDGET, COST_ARM_MAP)
 holdout_df = holdout_df.merge(holdout_allocation, on='user_id')
-holdout_df.head()
+```
+
+```python
+holdout_allocation_sd = budget_allocation(holdout_df_sd, BUDGET, COST_ARM_MAP)
+holdout_df_sd = holdout_df_sd.merge(holdout_allocation_sd, on='user_id')
+
 ```
 
 ```python
 matched_offer_arm = holdout_df[holdout_df['offer_arm'] == holdout_df['assigned_offer_arm']].copy()
-matched_offer_arm['assigned_offer_arm'].value_counts()
+matched_offer_arm['assigned_offer_arm'].value_counts(normalize = True)
 ```
 
 ```python
@@ -588,25 +571,34 @@ baseline_value, baseline_matched = estimate_policy_value(
     COST_ARM_MAP
 )
 
-# 3. Your uplift allocation policy
+# 3. Uplift allocation policy w/o sleeping dogs
 uplift_value, uplift_matched = estimate_policy_value(
     holdout_df,
     "assigned_offer_arm",
     COST_ARM_MAP
 )
 
+#4. Uplift allocation policy with sleeping dogs
+uplift_value_sd, uplift_matched_sd = estimate_policy_value(
+    holdout_df_sd,
+    "assigned_offer_arm",
+    COST_ARM_MAP
+)
 
 print("Estimated holdout policy values")
 print("--------------------------------")
 print(f"No-offer policy value:      {no_offer_value:,.2f}")
 print(f"Churn baseline value:       {baseline_value:,.2f}")
-print(f"Uplift allocation value:    {uplift_value:,.2f}")
+print(f"Uplift allocation value w/o sleeping dogs:    {uplift_value:,.2f}")
+print(f"Uplift allocation value with sleeping dogs:   {uplift_value_sd:,.2f}")
 
 print("\nIncremental values")
 print("--------------------------------")
 print(f"Baseline vs no-offer:       {baseline_value - no_offer_value:,.2f}")
-print(f"Uplift vs no-offer:         {uplift_value - no_offer_value:,.2f}")
+print(f"Uplift vs no-offer:         {uplift_value- no_offer_value:,.2f}")
 print(f"Uplift vs churn baseline:   {uplift_value - baseline_value:,.2f}")
+print(f"Uplift vs no-offer - Sleeping Dogs treated: {uplift_value_sd - no_offer_value:,.2f}")
+print(f"Uplift vs churn baseline - Sleeping Dogs treated: {uplift_value_sd - baseline_value:,.2f}")
 
 print("\nMatched rows")
 print("--------------------------------")
@@ -616,29 +608,73 @@ print(f"Uplift matched rows:        {len(uplift_matched)}")
 ```
 
 ```python
-holdout_df["uplift_score"] = holdout_df[[
+holdout_df_sd["uplift_score"] = holdout_df_sd[[
                                     "t_uplift_arm_1",
                                     "t_uplift_arm_2",
                                     "t_uplift_arm_3"]].max(axis=1)
 ```
 
+## Qini
+
 ```python
-from sklift.metrics import qini_auc_score
+# build Qini for dataset df_qini
+df_qini = holdout_df_sd.copy()
+qini_results ={}
 
-arms = [1, 2, 3]
+fig, axes = plt.subplots(1, 3, figsize=(18,5))
 
-for arm in arms:
-    arm_df = holdout_df[holdout_df["offer_arm"].isin([0,arm])].copy()
+for ax, arm in zip(axes, [1,2,3]):
+
+    arm_df = df_qini[
+        df_qini["offer_arm"].isin([0, arm])
+    ].copy()
+
     treatment = (arm_df["offer_arm"] == arm).astype(int)
 
-    score = arm_df[f"t_uplift_arm_{arm}"]
-
-    qini = qini_auc_score(
-        y_true=1-arm_df["churned"],   # retention
-        uplift=score,
+    # Baseline
+    x_base, y_base = qini_curve(
+        y_true= 1 - arm_df["churned"],
+        uplift= arm_df["baseline_pred_proba"], 
         treatment=treatment
     )
-    print(f"Qini AUC for arm {arm}: {qini:.4f}")
+
+    # T-learner
+    x_t, y_t = qini_curve(
+        y_true= 1 - arm_df["churned"],
+        uplift=arm_df[f"t_uplift_arm_{arm}"],
+        treatment=treatment
+    )
+
+
+    baseline_qini = qini_auc_score(y_true= 1 - arm_df["churned"], uplift= arm_df["baseline_pred_proba"], treatment=treatment)
+    uplift_qini = qini_auc_score(y_true= 1 - arm_df["churned"], uplift= arm_df[f"t_uplift_arm_{arm}"], treatment=treatment)
+
+    qini_results[arm] = uplift_qini
+
+    ax.plot(x_base, y_base, label="Baseline")
+    ax.plot(x_t, y_t, label="T-learner")
+    ax.set_title(f"Offer arm {arm}")
+    ax.set_xlabel("Number of targeted users")
+    ax.set_ylabel("Incremental retained customers")
+    ax.grid(True)
+    ax.legend()
+
+    print(f"ARM: {arm}")
+    print("Baseline churn model Qini AUC:", baseline_qini)
+    print("T-learner uplift model Qini AUC:", uplift_qini )
+    print("-"*100)
+
+plt.tight_layout()
+plt.show()
+
+
+weighted_qini = np.average(
+    list(qini_results.values()),
+    weights=[
+        len(holdout_df_sd[holdout_df_sd["offer_arm"].isin([0, arm])])
+        for arm in [1, 2, 3]
+    ])
+print("Weighted Qini AUC:", weighted_qini)
 ```
 
 # 6. Allocation for scoring
@@ -691,54 +727,14 @@ for arm, col in value_cols.items():
 ```
 
 ```python
-scoring["sleeping_dog"] = (
-    (scoring["tenure_months"] >21)|
-    (scoring["support_tickets_90d"]>=4)|    
-    (scoring["active_days_30d"] <= 1) 
-)
-
-scoring.loc[scoring["sleeping_dog"], "t_best_arm"] = 0
-scoring.loc[scoring["sleeping_dog"], "t_best_value"] = 0
-```
-
-```python
-scoring["t_best_cost"] = scoring["t_best_arm"].map(COST_ARM_MAP)
-scoring["t_best_roi"] = 0.0
-
-paid_offer = scoring["t_best_cost"] > 0
-scoring.loc[paid_offer, "t_best_roi"] = ( scoring.loc[paid_offer, "t_best_value"]/scoring.loc[paid_offer, "t_best_cost"])
-```
-
-```python
-## Allocation for scoring dataset#
-candidates = scoring[(scoring["t_best_arm"] != 0)   & (scoring["t_best_value"] > 0)].copy()
-
-candidates = candidates.sort_values("t_best_roi", ascending=False)
-
-scoring_allocation = scoring[["user_id"]].copy()
-scoring_allocation["assigned_offer_arm"] = 0
-
-used_budget = 0
-
-for idx, row in candidates.iterrows():
-    cost = COST_ARM_MAP[row["t_best_arm"]]
-
-    if used_budget + cost > BUDGET:
-        continue
-
-    scoring_allocation.loc[scoring_allocation["user_id"] == row["user_id"], "assigned_offer_arm" ] = int(row["t_best_arm"])
-
-    used_budget += cost
-
-print("Used budget:", used_budget)
-print("Remaining budget:", BUDGET - used_budget)
-print(scoring_allocation["assigned_offer_arm"].value_counts())
+scoring_sd = sleeping_dogs_treatment(scoring)
+scoring_allocation = budget_allocation(scoring_sd, BUDGET, COST_ARM_MAP)
 ```
 
 # Save results
 
 ```python
-holdout_df[['user_id', 'uplift_score']].to_csv("data/holdout_scores.csv", index=False)
+holdout_df_sd[['user_id', 'uplift_score']].to_csv("results/holdout_scores.csv", index=False)
 scoring_allocation.rename(columns={"assigned_offer_arm": "offer_arm"}, inplace=True)
-scoring_allocation.to_csv("data/allocation.csv", index=False)
+scoring_allocation.to_csv("results/allocation.csv", index=False)
 ```
